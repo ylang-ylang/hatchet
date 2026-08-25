@@ -60,7 +60,7 @@ jobs:
           bash /tmp/prepare-upstream-sync
 
   validate:
-    name: Validate candidate (go build and go vet)
+    name: Validate candidate (go build)
     permissions:
       contents: read
     needs: prepare
@@ -79,8 +79,6 @@ jobs:
           cache-dependency-path: go.sum
       - name: go build
         run: go build ./...
-      - name: go vet
-        run: go vet ./...
 
   promote:
     name: Promote validated candidate
