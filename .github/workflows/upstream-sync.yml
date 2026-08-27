@@ -91,12 +91,21 @@ jobs:
       needs.prepare.outputs.state == 'ready' &&
       needs.validate.result == 'success'
     runs-on: ubuntu-latest
+    outputs:
+      # Re-emitted so image-build jobs can consume it without depending on
+      # prepare (GitHub only exposes outputs of direct job dependencies).
+      candidate_sha: ${{ steps.record.outputs.candidate_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: patch/statement-timeout-set-local
           fetch-depth: 0
           token: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+      - name: Record candidate SHA
+        id: record
+        env:
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+        run: echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
       - name: Atomically update the downstream branch
         env:
           TARGET_BRANCH: patch/statement-timeout-set-local
@@ -133,6 +142,97 @@ jobs:
                 state: "closed",
               });
             }
+
+  build-images:
+    name: Build patched server images
+    permissions:
+      contents: read
+      packages: write
+    needs: promote
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # hatchet-api is included because the dashboard image is built on top
+        # of it (build/package/dashboard.dockerfile's HATCHET_API_IMAGE base).
+        target: [engine, migrate, admin, api]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.promote.outputs.candidate_sha }}
+          fetch-depth: 0
+      - name: Compute version and short SHA
+        id: meta
+        env:
+          CANDIDATE_SHA: ${{ needs.promote.outputs.candidate_sha }}
+        run: |
+          echo "short=${CANDIDATE_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          echo "version=$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push hatchet-${{ matrix.target }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/package/servers.dockerfile
+          build-args: |
+            SERVER_TARGET=${{ matrix.target }}
+            VERSION=${{ steps.meta.outputs.version }}
+          tags: |
+            ghcr.io/ylang-ylang/hatchet/hatchet-${{ matrix.target }}:latest-patched
+            ghcr.io/ylang-ylang/hatchet/hatchet-${{ matrix.target }}:${{ steps.meta.outputs.short }}
+          push: true
+
+  build-dashboard:
+    name: Build patched dashboard image
+    permissions:
+      contents: read
+      packages: write
+    needs: [promote, build-images]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.promote.outputs.candidate_sha }}
+          fetch-depth: 0
+      - name: Compute short SHA
+        id: meta
+        env:
+          CANDIDATE_SHA: ${{ needs.promote.outputs.candidate_sha }}
+        run: echo "short=${CANDIDATE_SHA:0:8}" >> "$GITHUB_OUTPUT"
+      - name: Generate docs snippets and examples
+        # The dashboard frontend imports @/lib/generated/docs, which is
+        # gitignored and produced by this generator (mirrors upstream
+        # build.yml). Without it `npm run build` fails in the image build.
+        working-directory: frontend/snippets
+        run: python3 generate.py
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push dashboard
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/package/dashboard.dockerfile
+          # The dashboard Dockerfile does `FROM $HATCHET_API_IMAGE`; apibase is
+          # a named build context resolving to the api image pushed above.
+          build-args: HATCHET_API_IMAGE=apibase
+          build-contexts: apibase=docker-image://ghcr.io/ylang-ylang/hatchet/hatchet-api:latest-patched
+          tags: |
+            ghcr.io/ylang-ylang/hatchet/hatchet-dashboard:latest-patched
+            ghcr.io/ylang-ylang/hatchet/hatchet-dashboard:${{ steps.meta.outputs.short }}
+          push: true
 
   report-failure:
     name: Report blocked sync
