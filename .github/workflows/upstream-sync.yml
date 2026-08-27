@@ -167,7 +167,10 @@ jobs:
           CANDIDATE_SHA: ${{ needs.promote.outputs.candidate_sha }}
         run: |
           echo "short=${CANDIDATE_SHA:0:8}" >> "$GITHUB_OUTPUT"
-          echo "version=$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)" >> "$GITHUB_OUTPUT"
+          # Only v* tags are real engine releases; bare `git describe` can
+          # pick SDK tags (e.g. py/1.38.0), which the SDK's semver engine
+          # check cannot parse and would misread as an old engine.
+          echo "version=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo v0.0.0)" >> "$GITHUB_OUTPUT"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Login to GHCR
