@@ -95,6 +95,12 @@ func PrepareTxWithStatementTimeout(ctx context.Context, pool *pgxpool.Pool, l *z
 		DeferRollback(ctx, l, tx.Rollback)
 	}
 
+	// Timeout hygiene: these session-level SETs are scoped to the
+	// transaction. The returned commit closure resets both to the pool
+	// default (30000) before COMMIT, and PostgreSQL undoes plain SET on
+	// ROLLBACK, so the lowered timeout never survives on a pooled
+	// connection. Callers must use the returned commit closure, never
+	// tx.Commit directly, to keep this invariant.
 	_, err = tx.Exec(ctx, fmt.Sprintf("SET statement_timeout=%d", timeoutMs))
 
 	if err != nil {
@@ -158,6 +164,11 @@ func AcquireConnectionWithStatementTimeout(ctx context.Context, pool *pgxpool.Po
 		conn.Release()
 	}
 
+	// Timeout hygiene: this session-level SET persists on the connection,
+	// so the release closure resets both timeouts to the pool default
+	// (30000) before conn.Release(). The only escape hatch is a failed
+	// reset (logged as an error), which returns the connection with the
+	// lowered timeout.
 	_, err = conn.Exec(ctx, fmt.Sprintf("SET statement_timeout=%d", timeoutMs))
 
 	if err != nil {
