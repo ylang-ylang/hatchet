@@ -192,6 +192,12 @@ func (c *ConfigLoader) InitDataLayer() (res *database.Layer, err error) {
 			}
 		}
 
+		// Pool baseline, not a leak: AfterConnect runs once per newly
+		// created connection, so every connection that enters the pool
+		// starts with these session-level defaults. Transaction-scoped
+		// overrides (SET LOCAL in tenant.go heartbeats) or explicit resets
+		// (sqlchelpers helpers) restore these values before connections are
+		// returned to the pool.
 		_, err = conn.Exec(ctx, "SET statement_timeout=30000")
 		if err != nil {
 			return err
