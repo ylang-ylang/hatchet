@@ -687,6 +687,15 @@ func (r *tenantRepository) UpdateControllerPartitionHeartbeat(ctx context.Contex
 		return "", err
 	}
 
+	// BUG-01 diagnostic: prove the patched heartbeat path (SET LOCAL) ran, so
+	// a future statement-timeout can be attributed to patched vs unpatched
+	// engine code. The backend pid query only runs when debug logging is on.
+	if r.l.Debug().Enabled() {
+		var backendPid int
+		_ = tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&backendPid)
+		r.l.Debug().Ctx(ctx).Int("backend_pid", backendPid).Msg("patched controller-partition heartbeat: SET LOCAL statement_timeout=5000 executed")
+	}
+
 	partition, err := r.queries.ControllerPartitionHeartbeat(ctx, tx, partitionId)
 
 	if err != nil {
@@ -732,6 +741,15 @@ func (r *tenantRepository) UpdateWorkerPartitionHeartbeat(ctx context.Context, p
 
 	if err != nil {
 		return "", err
+	}
+
+	// BUG-01 diagnostic: prove the patched heartbeat path (SET LOCAL) ran, so
+	// a future statement-timeout can be attributed to patched vs unpatched
+	// engine code. The backend pid query only runs when debug logging is on.
+	if r.l.Debug().Enabled() {
+		var backendPid int
+		_ = tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&backendPid)
+		r.l.Debug().Ctx(ctx).Int("backend_pid", backendPid).Msg("patched worker-partition heartbeat: SET LOCAL statement_timeout=5000 executed")
 	}
 
 	partition, err := r.queries.WorkerPartitionHeartbeat(ctx, tx, partitionId)
@@ -854,6 +872,15 @@ func (r *tenantRepository) UpdateSchedulerPartitionHeartbeat(ctx context.Context
 
 	if err != nil {
 		return "", err
+	}
+
+	// BUG-01 diagnostic: prove the patched heartbeat path (SET LOCAL) ran, so
+	// a future statement-timeout can be attributed to patched vs unpatched
+	// engine code. The backend pid query only runs when debug logging is on.
+	if r.l.Debug().Enabled() {
+		var backendPid int
+		_ = tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&backendPid)
+		r.l.Debug().Ctx(ctx).Int("backend_pid", backendPid).Msg("patched scheduler-partition heartbeat: SET LOCAL statement_timeout=5000 executed")
 	}
 
 	partition, err := r.queries.SchedulerPartitionHeartbeat(ctx, tx, partitionId)
