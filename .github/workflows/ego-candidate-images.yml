@@ -1,0 +1,66 @@
+name: Build frozen ego Hatchet candidate
+
+on:
+  push:
+    branches: [patch/upgrade-v0.106.4]
+    paths: [.github/workflows/ego-candidate-images.yml]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      SOURCE_REVISION: 6362fd7da8891b46cecb8b3c28e537d434b8cbd5
+      IMAGE_PREFIX: ghcr.io/ylang-ylang/hatchet
+      CANDIDATE_TAG: v0.106.4-ego-sweep-6362fd7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 6362fd7da8891b46cecb8b3c28e537d434b8cbd5
+          persist-credentials: false
+      - name: Install Podman build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman crun
+      - name: Generate dashboard documentation assets
+        working-directory: frontend/snippets
+        run: python3 generate.py
+      - name: Build and publish immutable candidate images
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          authfile="$RUNNER_TEMP/ego-registry-auth.json"
+          trap 'rm -f "$authfile"' EXIT
+          printf '{}' > "$authfile"
+          chmod 600 "$authfile"
+          printf '%s' "$REGISTRY_TOKEN" | podman login --authfile "$authfile" --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          mkdir -p "$RUNNER_TEMP/ego-image-digests"
+          printf '%s\n' "$SOURCE_REVISION" > "$RUNNER_TEMP/ego-image-digests/source-revision.txt"
+          for target in engine api admin migrate; do
+            image="$IMAGE_PREFIX/hatchet-$target:$CANDIDATE_TAG"
+            podman build --authfile "$authfile" --runtime /usr/bin/crun --layers \
+              --label "org.opencontainers.image.source=https://github.com/ylang-ylang/hatchet" \
+              --label "org.opencontainers.image.revision=$SOURCE_REVISION" \
+              --build-arg SERVER_TARGET="$target" --build-arg VERSION=v0.106.4 \
+              -f build/package/servers.dockerfile -t "$image" .
+            podman push --authfile "$authfile" --digestfile "$RUNNER_TEMP/ego-image-digests/$target.digest" "$image"
+          done
+          api_base="$IMAGE_PREFIX/hatchet-api@$(cat "$RUNNER_TEMP/ego-image-digests/api.digest")"
+          image="$IMAGE_PREFIX/hatchet-dashboard:$CANDIDATE_TAG"
+          podman build --authfile "$authfile" --runtime /usr/bin/crun --layers \
+            --label "org.opencontainers.image.source=https://github.com/ylang-ylang/hatchet" \
+            --label "org.opencontainers.image.revision=$SOURCE_REVISION" \
+            --build-arg HATCHET_API_IMAGE="$api_base" \
+            -f build/package/dashboard.dockerfile -t "$image" .
+          podman push --authfile "$authfile" --digestfile "$RUNNER_TEMP/ego-image-digests/dashboard.digest" "$image"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ego-hatchet-6362fd7-digests
+          path: ${{ runner.temp }}/ego-image-digests/
+          if-no-files-found: warn
