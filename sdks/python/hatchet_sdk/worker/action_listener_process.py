@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import multiprocessing.synchronize
+import os
 import signal
 import time
 import warnings
@@ -9,6 +10,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
 from multiprocessing import Queue
+from threading import Thread
 from typing import Any
 
 import grpc
@@ -575,6 +577,20 @@ def worker_action_listener_process(
     worker_id_queue: "Queue[str]",
     stop_event: "multiprocessing.synchronize.Event",
 ) -> None:
+    parent = multiprocessing.parent_process()
+    if parent is not None:
+        # A hard parent exit bypasses stop_event/STOP_LOOP. Without this guard
+        # the orphan listener keeps heartbeating and acknowledges unexecutable
+        # tasks. The spawn sentinel avoids PID reuse and polling; a daemon
+        # thread does not hold up the normal completion-event drain.
+        def exit_with_parent() -> None:
+            parent.join()
+            os._exit(1)
+
+        Thread(
+            target=exit_with_parent, name="hatchet-parent-watch", daemon=True
+        ).start()
+
     async def run() -> None:
         process = WorkerActionListenerProcess(
             name=name,

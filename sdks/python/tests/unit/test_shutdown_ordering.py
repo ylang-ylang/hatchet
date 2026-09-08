@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import multiprocessing
+import os
+import signal
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -80,6 +83,24 @@ def _subprocess_target(
             worker_id_queue=worker_id_queue,
             stop_event=stop_event,
         )
+
+
+def _tracked_listener(lifetime_pipe: Any, args: tuple[Any, ...]) -> None:
+    try:
+        _subprocess_target(*args)
+    finally:
+        lifetime_pipe.close()
+
+
+def _crashing_listener_parent(
+    control: Any, lifetime_pipe: Any, args: tuple[Any, ...]
+) -> None:
+    listener = _CTX.Process(target=_tracked_listener, args=(lifetime_pipe, args))
+    listener.start()
+    lifetime_pipe.close()
+    control.send(listener.pid)
+    control.recv()
+    os._exit(23)
 
 
 @dataclass
@@ -356,3 +377,73 @@ def test_event_queue_drains_before_process_exits() -> None:
     assert (
         event_queue.empty()
     ), "event_queue must be fully drained before subprocess exits"
+
+
+def test_listener_exits_when_execution_parent_dies() -> None:
+    """A hard parent exit must not leave a listener accepting unexecutable work."""
+    action_queue: Any = _CTX.Queue()
+    event_queue: Any = _CTX.Queue()
+    worker_id_queue: Any = _CTX.Queue()
+    stop_event = _CTX.Event()
+    config = ClientConfig.model_construct(
+        healthcheck=HealthcheckConfig(),
+        debug=False,
+        disable_log_capture=True,
+    )
+    control, child_control = _CTX.Pipe()
+    lifetime_reader, lifetime_writer = _CTX.Pipe(duplex=False)
+    parent = _CTX.Process(
+        target=_crashing_listener_parent,
+        args=(
+            child_control,
+            lifetime_writer,
+            (
+                "test-worker",
+                ["test_action"],
+                {"default": 1, "durable": 0},
+                config,
+                action_queue,
+                event_queue,
+                False,
+                False,
+                [],
+                worker_id_queue,
+                stop_event,
+            ),
+        ),
+    )
+    listener_pid: int | None = None
+    parent.start()
+    child_control.close()
+    lifetime_writer.close()
+    try:
+        assert control.poll(10), "parent never spawned the listener"
+        listener_pid = control.recv()
+        worker_id_queue.get(timeout=10)
+        control.send("crash")
+        parent.join(timeout=5)
+        assert parent.exitcode == 23
+
+        # Only the listener still holds the write end. EOF proves process
+        # exit even when an orphan has not yet been reaped by the OS.
+        assert lifetime_reader.poll(10), "orphan listener survived its parent"
+        with pytest.raises(EOFError):
+            lifetime_reader.recv()
+    finally:
+        if parent.is_alive():
+            parent.kill()
+            parent.join(timeout=5)
+        if listener_pid is not None and not lifetime_reader.poll():
+            # Also stop the pre-fix orphan: its event loop is still
+            # alive, so the normal stop protocol remains available here.
+            stop_event.set()
+            event_queue.put(STOP_LOOP)
+            if not lifetime_reader.poll(5):
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(listener_pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                assert lifetime_reader.poll(5), "listener cleanup did not finish"
+        for connection in (control, lifetime_reader):
+            connection.close()
+        for queue in (action_queue, event_queue, worker_id_queue):
+            queue.cancel_join_thread()
+            queue.close()
