@@ -26,7 +26,6 @@ import (
 	tasktypesv1 "github.com/hatchet-dev/hatchet/internal/services/shared/tasktypes/v1"
 	"github.com/hatchet-dev/hatchet/internal/syncx"
 	"github.com/hatchet-dev/hatchet/pkg/analytics"
-	"github.com/hatchet-dev/hatchet/pkg/encryption"
 	"github.com/hatchet-dev/hatchet/pkg/integrations/metrics/prometheus"
 	"github.com/hatchet-dev/hatchet/pkg/logger"
 	"github.com/hatchet-dev/hatchet/pkg/operator"
@@ -174,8 +173,6 @@ type DispatcherOpts struct {
 	defaultMaxWorkerLockAcquisitionTime time.Duration
 	workflowRunBufferSize               int
 	streamEventBufferTimeout            time.Duration
-	enc                                 encryption.EncryptionService
-	infraBlockedCIDRs                   []string
 	dagOperatorDefaultSlots             int
 	dispatcherId                        uuid.UUID
 	promGate                            *prometheus.Gate
@@ -243,18 +240,6 @@ func WithDispatcherId(dispatcherId uuid.UUID) DispatcherOpt {
 func WithCache(cache cache.Cacheable) DispatcherOpt {
 	return func(opts *DispatcherOpts) {
 		opts.cache = cache
-	}
-}
-
-func WithEncryption(enc encryption.EncryptionService) DispatcherOpt {
-	return func(opts *DispatcherOpts) {
-		opts.enc = enc
-	}
-}
-
-func WithInfraBlockedCIDRs(cidrs []string) DispatcherOpt {
-	return func(opts *DispatcherOpts) {
-		opts.infraBlockedCIDRs = cidrs
 	}
 }
 
@@ -344,7 +329,7 @@ func New(fs ...DispatcherOpt) (*DispatcherImpl, error) {
 
 	pubBuffer := msgqueue.NewMQPubBuffer(opts.mqv1)
 
-	om := manager.NewOperatorManager(opts.dispatcherId, opts.l, opts.repov1, opts.enc, opts.infraBlockedCIDRs, opts.dagOperatorDefaultSlots)
+	om := manager.NewOperatorManager(opts.dispatcherId, opts.l, opts.repov1, opts.dagOperatorDefaultSlots)
 	v := validator.NewDefaultValidator()
 
 	return &DispatcherImpl{
@@ -416,7 +401,14 @@ func (d *DispatcherImpl) Start() (func() error, error) {
 		defer wg.Done()
 
 		if taskErr := d.handleV1Task(ctx, task); taskErr != nil {
-			d.l.Error().Ctx(ctx).Err(taskErr).Msgf("could not handle dispatcher task %s", task.ID)
+			// ErrNoActiveDurableInvocation is an expected, self-healing condition (worker
+			// reconnecting after a roll); it's returned so the callback dead-letters and is
+			// re-routed, not because anything is wrong here.
+			if errors.Is(taskErr, ErrNoActiveDurableInvocation) {
+				d.l.Warn().Ctx(ctx).Err(taskErr).Msgf("deferring dispatcher task %s to dead-letter retry", task.ID)
+			} else {
+				d.l.Error().Ctx(ctx).Err(taskErr).Msgf("could not handle dispatcher task %s", task.ID)
+			}
 			return taskErr
 		}
 
@@ -574,6 +566,10 @@ func (d *DispatcherImpl) DispatcherId() uuid.UUID {
 func (d *DispatcherImpl) handleDurableCallbackCompleted(ctx context.Context, task *msgqueue.Message) error {
 	payloads := msgqueue.JSONConvert[tasktypesv1.DurableCallbackCompletedPayload](task.Payloads)
 
+	// We need to return no active invocation errors because otherwise they will get stuck on engine failure, never go to DLQ,
+	// and then the next engine that stands up will have no idea about it, leading to runs stuck in RUNNING
+	var retryErr error
+
 	for _, payload := range payloads {
 		err := d.serviceV1.DeliverDurableEventLogEntryCompletion(
 			task.TenantID,
@@ -587,12 +583,20 @@ func (d *DispatcherImpl) handleDurableCallbackCompleted(ctx context.Context, tas
 			payload.ChildTaskErrorMessage,
 		)
 
-		if err != nil {
-			d.l.Warn().Err(err).Msgf("failed to deliver callback completion for task %s (worker may still be reconnecting; polling path will catch up)", payload.TaskExternalId)
+		if err == nil {
+			continue
 		}
+
+		if errors.Is(err, ErrNoActiveDurableInvocation) {
+			d.l.Warn().Err(err).Msgf("deferring callback completion for task %s (worker reconnecting); will redeliver", payload.TaskExternalId)
+			retryErr = err
+			continue
+		}
+
+		d.l.Warn().Err(err).Msgf("failed to deliver callback completion for task %s", payload.TaskExternalId)
 	}
 
-	return nil
+	return retryErr
 }
 
 func (d *DispatcherImpl) runUpdateHeartbeat(ctx context.Context) func() {

@@ -33,6 +33,7 @@ func DispatchCallbacks(ctx context.Context, l *zerolog.Logger, mq msgqueue.Messa
 	}
 
 	dispatcherToMsgs := make(map[uuid.UUID][]*msgqueue.Message)
+	restorePublished := make(map[uuid.UUID]struct{})
 
 	for _, cb := range callbacks {
 		key := v1.IdInsertedAt{
@@ -48,6 +49,12 @@ func DispatchCallbacks(ctx context.Context, l *zerolog.Logger, mq msgqueue.Messa
 		}
 
 		if dispatcherLookup.IsEvicted {
+			if _, ok := restorePublished[cb.DurableTaskExternalId]; ok {
+				continue
+			}
+
+			restorePublished[cb.DurableTaskExternalId] = struct{}{}
+
 			l.Debug().Msgf("task %d is evicted, publishing restore message", cb.DurableTaskId)
 
 			restoreMsg, err := tasktypes.DurableRestoreTaskMessage(tenantId, cb.DurableTaskExternalId, "callback satisfied while task evicted")
@@ -78,6 +85,7 @@ func DispatchCallbacks(ctx context.Context, l *zerolog.Logger, mq msgqueue.Messa
 			cb.SatisfiedOrder,
 			cb.ChildTaskIsFailure,
 			cb.ChildTaskErrorMessage,
+			cb.RedeliveryCount,
 		)
 		if err != nil {
 			l.Error().Err(err).Msgf("failed to create callback completed message for task %s node %d", cb.DurableTaskExternalId.String(), cb.NodeId)
