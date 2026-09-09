@@ -2,7 +2,7 @@ name: Build frozen ego Hatchet candidate
 
 on:
   push:
-    branches: [patch/upgrade-v0.106.4]
+    branches: [patch/olap-run-identity]
     paths: [.github/workflows/ego-candidate-images.yml]
 
 permissions:
@@ -14,13 +14,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      SOURCE_REVISION: 6362fd7da8891b46cecb8b3c28e537d434b8cbd5
+      SOURCE_REVISION: 02c45f1c45b33a8d7928865c888343d380d67ece
       IMAGE_PREFIX: ghcr.io/ylang-ylang/hatchet
-      CANDIDATE_TAG: v0.106.4-ego-sweep-6362fd7
+      CANDIDATE_TAG: v0.106.4-ego-sweep-02c45f1
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 6362fd7da8891b46cecb8b3c28e537d434b8cbd5
+          ref: 02c45f1c45b33a8d7928865c888343d380d67ece
           persist-credentials: false
       - name: Install Podman build tools
         run: |
@@ -61,6 +61,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ego-hatchet-6362fd7-digests
+          name: ego-hatchet-02c45f1-digests
           path: ${{ runner.temp }}/ego-image-digests/
           if-no-files-found: warn
