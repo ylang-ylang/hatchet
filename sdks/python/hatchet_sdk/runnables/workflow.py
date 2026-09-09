@@ -5,6 +5,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from enum import Enum
 from functools import cached_property
+from itertools import chain
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -187,7 +188,13 @@ class BaseWorkflow(Generic[TWorkflowInput]):
         return self.service_name + ":" + step.name
 
     def _is_leaf_task(self, task: Task[TWorkflowInput, Any]) -> bool:
-        return not any(task in t.parents for t in self.tasks if task != t)
+        # Hook parents are derived from leaves; including them in this scan
+        # makes repeated serialization alternate between leaves and no parents.
+        return not any(
+            task in t.parents
+            for t in chain(self._default_tasks, self._durable_tasks)
+            if task != t
+        )
 
     def to_proto(self) -> CreateWorkflowVersionRequest:
         namespace = self._client.config.namespace
