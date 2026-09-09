@@ -1839,17 +1839,44 @@ WITH tasks AS (
         AND lt.tenant_id = $2::uuid
         AND (
             -- the orchestrator's self-mapping row is hidden by default once real child tasks
-            -- exist, since orchestration is abstracted away from the user
+            -- exist, since orchestration is abstracted away from the user. only junction rows
+            -- whose task identity coincides with the dag identity (both id and inserted_at) can
+            -- be the orchestrator self-mapping; real child tasks are always included
             COALESCE($3::boolean, FALSE)
             OR dt.task_id != dt.dag_id
+            OR dt.task_inserted_at != dt.dag_inserted_at
+            -- a classic dag whose root task shares the dag's (id, inserted_at) produces a
+            -- trigger-written junction row that is byte-identical to the orchestrator
+            -- self-mapping, but the root task row exists in v1_tasks_olap and points back at the
+            -- dag, so the row is a genuine task and must never be hidden by default
+            OR EXISTS (
+                SELECT 1
+                FROM v1_tasks_olap t
+                WHERE t.tenant_id = lt.tenant_id
+                    AND (t.id, t.inserted_at) = (dt.dag_id, dt.dag_inserted_at)
+                    AND (t.dag_id, t.dag_inserted_at) = (dt.dag_id, dt.dag_inserted_at)
+            )
             OR NOT EXISTS (
                 SELECT 1
                 FROM v1_dag_to_task_olap other
                 WHERE other.dag_id = dt.dag_id
                     AND other.dag_inserted_at = dt.dag_inserted_at
-                    AND other.task_id != other.dag_id
+                    AND (
+                        other.task_id != other.dag_id
+                        OR other.task_inserted_at != other.dag_inserted_at
+                    )
             )
         )
+    -- a standalone run is keyed in the lookup table by the task itself (dag_id NULL, i.e. the
+    -- run row is the task's own): include its events directly, without dag-to-task expansion
+    UNION ALL
+    SELECT lt.task_id, lt.inserted_at, NULL::bigint, NULL::timestamptz
+    FROM v1_lookup_table_olap lt
+    WHERE
+        lt.external_id = $1::uuid
+        AND lt.tenant_id = $2::uuid
+        AND lt.dag_id IS NULL
+        AND lt.task_id IS NOT NULL
 ), aggregated_events AS (
     SELECT
         e.tenant_id,
@@ -3635,13 +3662,24 @@ WITH tenants AS (
             FROM
                 distinct_dags dd
         )
-        -- see UpdateDAGStatusesFromMQ
+        -- see UpdateDAGStatusesFromMQ: only exclude dags whose self-shaped junction row is a
+        -- true operator self-mapping, i.e. one NOT backed by a real task row in v1_tasks_olap.
+        -- classic dags whose root task shares the dag's (id, inserted_at) have that backing row
+        -- and must still be rolled up here
         AND NOT EXISTS (
             SELECT 1
             FROM v1_dag_to_task_olap dt
             WHERE
                 (dt.dag_id, dt.dag_inserted_at) = (d.id, d.inserted_at)
                 AND (dt.task_id, dt.task_inserted_at) = (d.id, d.inserted_at)
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM v1_tasks_olap t
+                    WHERE
+                        t.tenant_id = d.tenant_id
+                        AND (t.id, t.inserted_at) = (d.id, d.inserted_at)
+                        AND (t.dag_id, t.dag_inserted_at) = (d.id, d.inserted_at)
+                )
         )
     ORDER BY
         d.inserted_at, d.id
@@ -3914,12 +3952,28 @@ WITH inputs AS (
     -- operator dags are updated by the separate UpdateDAGStatusesFromOrchestratorEvents. the
     -- orchestrator's self-mapping row is what marks them, and older binaries already write it, so
     -- this classifies correctly even for dags created by a pod that predates this change
+    --
+    -- a junction row is only an operator self-mapping when it is NOT backed by a real task row
+    -- in v1_tasks_olap: a classic dag whose root task shares the dag's (id, inserted_at) (both
+    -- identity sequences start at 1, and the root task is created in the same transaction as the
+    -- dag) produces a trigger-written v1_dag_to_task_olap row that is byte-identical to the
+    -- orchestrator self-mapping, but the root task row exists and points back at the dag. such
+    -- classic dags must still be rolled up here, while operator dags (whose orchestrator task is
+    -- never emitted to v1_tasks_olap) have no backing row and stay excluded.
     AND NOT EXISTS (
         SELECT 1
         FROM v1_dag_to_task_olap dt
         WHERE
             (dt.dag_id, dt.dag_inserted_at) = (d.id, d.inserted_at)
             AND (dt.task_id, dt.task_inserted_at) = (d.id, d.inserted_at)
+            AND NOT EXISTS (
+                SELECT 1
+                FROM v1_tasks_olap t
+                WHERE
+                    t.tenant_id = d.tenant_id
+                    AND (t.id, t.inserted_at) = (d.id, d.inserted_at)
+                    AND (t.dag_id, t.dag_inserted_at) = (d.id, d.inserted_at)
+            )
     )
     ORDER BY inserted_at, id
     FOR UPDATE
