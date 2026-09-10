@@ -662,7 +662,10 @@ func (r *tenantRepository) ListTenants(ctx context.Context) ([]*sqlcv1.Tenant, e
 	return r.queries.ListTenants(ctx, r.pool)
 }
 
-func (r *tenantRepository) UpdateControllerPartitionHeartbeat(ctx context.Context, partitionId string) (string, error) {
+func (r *tenantRepository) UpdateControllerPartitionHeartbeat(ctx context.Context, partitionId string) (id string, err error) {
+	defer func() {
+		r.observeControlPlaneWrite(ctx, "controller-partition-heartbeat", err)
+	}()
 	tx, err := r.pool.Begin(ctx)
 
 	if err != nil {
@@ -718,7 +721,10 @@ func (r *tenantRepository) UpdateControllerPartitionHeartbeat(ctx context.Contex
 	return partition.ID, nil
 }
 
-func (r *tenantRepository) UpdateWorkerPartitionHeartbeat(ctx context.Context, partitionId string) (string, error) {
+func (r *tenantRepository) UpdateWorkerPartitionHeartbeat(ctx context.Context, partitionId string) (id string, err error) {
+	defer func() {
+		r.observeControlPlaneWrite(ctx, "worker-partition-heartbeat", err)
+	}()
 	tx, err := r.pool.Begin(ctx)
 
 	if err != nil {
@@ -849,7 +855,10 @@ func (r *tenantRepository) RebalanceInactiveTenantWorkerPartitions(ctx context.C
 	return r.queries.RebalanceInactiveTenantWorkerPartitions(ctx, r.pool)
 }
 
-func (r *tenantRepository) UpdateSchedulerPartitionHeartbeat(ctx context.Context, partitionId string) (string, error) {
+func (r *tenantRepository) UpdateSchedulerPartitionHeartbeat(ctx context.Context, partitionId string) (id string, err error) {
+	defer func() {
+		r.observeControlPlaneWrite(ctx, "scheduler-partition-heartbeat", err)
+	}()
 	tx, err := r.pool.Begin(ctx)
 
 	if err != nil {

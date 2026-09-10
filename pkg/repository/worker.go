@@ -802,10 +802,11 @@ func (w *workerRepository) UpdateWorkerHeartbeat(ctx context.Context, tenantId u
 	})
 
 	if err != nil {
-		return fmt.Errorf("could not update worker heartbeat: %w", err)
+		err = fmt.Errorf("could not update worker heartbeat: %w", err)
 	}
+	w.observeControlPlaneWrite(ctx, "worker-heartbeat", err)
 
-	return nil
+	return err
 }
 
 func (w *workerRepository) UpdateWorkerHeartbeats(ctx context.Context, workerIds []uuid.UUID, lastHeartbeat time.Time) error {
@@ -819,10 +820,11 @@ func (w *workerRepository) UpdateWorkerHeartbeats(ctx context.Context, workerIds
 	})
 
 	if err != nil {
-		return fmt.Errorf("could not update worker heartbeats: %w", err)
+		err = fmt.Errorf("could not update worker heartbeats: %w", err)
 	}
+	w.observeControlPlaneWrite(ctx, "operator-worker-heartbeat", err)
 
-	return nil
+	return err
 }
 
 func (w *workerRepository) PauseWorkers(ctx context.Context, workerIds []uuid.UUID) error {

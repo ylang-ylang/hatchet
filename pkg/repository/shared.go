@@ -54,6 +54,7 @@ type sharedRepository struct {
 	taskLookupCache   *lru.Cache[taskExternalIdTenantIdTuple, *sqlcv1.FlattenExternalIdsRow]
 	payloadStore      PayloadStoreRepository
 	m                 TenantLimitRepository
+	controlPlaneHealth controlPlaneHealth
 }
 
 func newSharedRepository(

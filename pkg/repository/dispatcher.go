@@ -51,10 +51,13 @@ func (d *dispatcherRepository) UpdateDispatcher(ctx context.Context, dispatcherI
 		return nil, err
 	}
 
-	return d.queries.UpdateDispatcher(ctx, d.pool, sqlcv1.UpdateDispatcherParams{
+	dispatcher, err := d.queries.UpdateDispatcher(ctx, d.pool, sqlcv1.UpdateDispatcherParams{
 		ID:              dispatcherId,
 		LastHeartbeatAt: sqlchelpers.TimestampFromTime(opts.LastHeartbeatAt.UTC()),
 	})
+	d.observeControlPlaneWrite(ctx, "dispatcher-heartbeat", err)
+
+	return dispatcher, err
 }
 
 func (d *dispatcherRepository) Delete(ctx context.Context, dispatcherId uuid.UUID) error {

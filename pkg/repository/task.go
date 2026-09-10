@@ -1544,7 +1544,21 @@ func (r *TaskRepositoryImpl) ProcessTaskTimeouts(ctx context.Context, tenantId u
 	}, len(toTimeout) == limit, nil
 }
 
+func emptyFailTasksResponse() *FailTasksResponse {
+	return &FailTasksResponse{
+		FinalizedTaskResponse: &FinalizedTaskResponse{
+			ReleasedTasks:  make([]*sqlcv1.ReleaseTasksRow, 0),
+			InternalEvents: make([]InternalTaskEvent, 0),
+		},
+		RetriedTasks: make([]RetriedTask, 0),
+	}
+}
+
 func (r *TaskRepositoryImpl) ProcessTaskReassignments(ctx context.Context, tenantId uuid.UUID) (*FailTasksResponse, bool, error) {
+	if r.shouldSuppressTaskReassignment(ctx, tenantId) {
+		return emptyFailTasksResponse(), false, nil
+	}
+
 	tx, commit, rollback, err := sqlchelpers.PrepareTx(ctx, r.pool, r.l)
 
 	if err != nil {
@@ -1568,13 +1582,7 @@ func (r *TaskRepositoryImpl) ProcessTaskReassignments(ctx context.Context, tenan
 	}
 
 	if len(toReassign) == 0 {
-		return &FailTasksResponse{
-			FinalizedTaskResponse: &FinalizedTaskResponse{
-				ReleasedTasks:  make([]*sqlcv1.ReleaseTasksRow, 0),
-				InternalEvents: make([]InternalTaskEvent, 0),
-			},
-			RetriedTasks: make([]RetriedTask, 0),
-		}, false, nil
+		return emptyFailTasksResponse(), false, nil
 	}
 
 	// parse into FailTaskOpts

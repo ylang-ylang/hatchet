@@ -100,7 +100,7 @@ func (t *tickerRepository) UpdateTicker(ctx context.Context, tickerId uuid.UUID,
 		return nil, err
 	}
 
-	return t.queries.UpdateTicker(
+	ticker, err := t.queries.UpdateTicker(
 		ctx,
 		t.pool,
 		sqlcv1.UpdateTickerParams{
@@ -108,6 +108,9 @@ func (t *tickerRepository) UpdateTicker(ctx context.Context, tickerId uuid.UUID,
 			LastHeartbeatAt: sqlchelpers.TimestampFromTime(opts.LastHeartbeatAt.UTC()),
 		},
 	)
+	t.observeControlPlaneWrite(ctx, "ticker-heartbeat", err)
+
+	return ticker, err
 }
 
 func (t *tickerRepository) ListTickers(ctx context.Context, opts *ListTickerOpts) ([]*sqlcv1.Ticker, error) {

@@ -31,9 +31,12 @@ func newLeaseRepository(shared *sharedRepository) *leaseRepository {
 	}
 }
 
-func (d *leaseRepository) AcquireOrExtendLeases(ctx context.Context, tenantId uuid.UUID, kind sqlcv1.LeaseKind, resourceIds []string, existingLeases []*sqlcv1.Lease) ([]*sqlcv1.Lease, error) {
+func (d *leaseRepository) AcquireOrExtendLeases(ctx context.Context, tenantId uuid.UUID, kind sqlcv1.LeaseKind, resourceIds []string, existingLeases []*sqlcv1.Lease) (leases []*sqlcv1.Lease, err error) {
 	ctx, span := telemetry.NewSpan(ctx, "acquire-leases")
 	defer span.End()
+	defer func() {
+		d.observeControlPlaneWrite(ctx, "scheduler-lease", err)
+	}()
 
 	leaseIds := make([]int64, len(existingLeases))
 
@@ -59,7 +62,7 @@ func (d *leaseRepository) AcquireOrExtendLeases(ctx context.Context, tenantId uu
 		return nil, err
 	}
 
-	leases, err := d.queries.AcquireOrExtendLeases(ctx, tx, sqlcv1.AcquireOrExtendLeasesParams{
+	leases, err = d.queries.AcquireOrExtendLeases(ctx, tx, sqlcv1.AcquireOrExtendLeasesParams{
 		Kind:             kind,
 		Resourceids:      resourceIds,
 		Tenantid:         tenantId,
@@ -70,16 +73,19 @@ func (d *leaseRepository) AcquireOrExtendLeases(ctx context.Context, tenantId uu
 		return nil, err
 	}
 
-	if err := commit(ctx); err != nil {
+	if err = commit(ctx); err != nil {
 		return nil, err
 	}
 
 	return leases, nil
 }
 
-func (d *leaseRepository) ReleaseLeases(ctx context.Context, tenantId uuid.UUID, leases []*sqlcv1.Lease) error {
+func (d *leaseRepository) ReleaseLeases(ctx context.Context, tenantId uuid.UUID, leases []*sqlcv1.Lease) (err error) {
 	ctx, span := telemetry.NewSpan(ctx, "release-leases")
 	defer span.End()
+	defer func() {
+		d.observeControlPlaneWrite(ctx, "scheduler-lease-release", err)
+	}()
 
 	leaseIds := make([]int64, len(leases))
 
@@ -101,7 +107,7 @@ func (d *leaseRepository) ReleaseLeases(ctx context.Context, tenantId uuid.UUID,
 		return err
 	}
 
-	if err := commit(ctx); err != nil {
+	if err = commit(ctx); err != nil {
 		return err
 	}
 
