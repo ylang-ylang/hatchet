@@ -14,13 +14,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      SOURCE_REVISION: 02c45f1c45b33a8d7928865c888343d380d67ece
+      SOURCE_REVISION: 8dcfac85f3427cbf739c367ec1d839f4252f4837
       IMAGE_PREFIX: ghcr.io/ylang-ylang/hatchet
-      CANDIDATE_TAG: v0.106.4-ego-sweep-02c45f1
+      CANDIDATE_TAG: v0.106.4-ego-sweep-8dcfac85
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 02c45f1c45b33a8d7928865c888343d380d67ece
+          ref: 8dcfac85f3427cbf739c367ec1d839f4252f4837
           persist-credentials: false
       - name: Install Podman build tools
         run: |
@@ -61,6 +61,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ego-hatchet-02c45f1-digests
+          name: ego-hatchet-8dcfac85-digests
           path: ${{ runner.temp }}/ego-image-digests/
           if-no-files-found: warn
