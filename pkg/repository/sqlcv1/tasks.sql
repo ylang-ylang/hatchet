@@ -462,33 +462,64 @@ WHERE
     AND runtime.batch_id = @batchId::uuid;
 
 -- name: ListTasksToReassign :many
-WITH tasks_on_inactive_workers AS (
+-- Task finalizers lock v1_task before v1_task_runtime. Reassignment must use the same order:
+-- skip tasks already being finalized, then lock only the surviving runtime identities.
+WITH locked_tasks AS MATERIALIZED (
+    SELECT
+        task.id,
+        task.inserted_at,
+        task.retry_count
+    FROM
+        "Worker" w
+    JOIN
+        v1_task_runtime runtime ON
+            w."id" = runtime.worker_id AND
+            w."tenantId" = runtime.tenant_id
+    JOIN
+        v1_task task ON
+            task.id = runtime.task_id AND
+            task.inserted_at = runtime.task_inserted_at AND
+            task.retry_count = runtime.retry_count
+    WHERE
+        w."tenantId" = @tenantId::uuid
+        AND task.tenant_id = @tenantId::uuid
+        AND w."lastHeartbeatAt" < NOW() - INTERVAL '30 seconds'
+        -- evicted tasks are not eligible for re-assignment
+        AND runtime.evicted_at IS NULL
+    ORDER BY
+        task.id, task.inserted_at, task.retry_count
+    LIMIT
+        COALESCE(sqlc.narg('limit')::integer, 1000)
+    FOR UPDATE OF task SKIP LOCKED
+), locked_runtimes AS MATERIALIZED (
     SELECT
         runtime.task_id,
         runtime.task_inserted_at,
         runtime.retry_count
     FROM
-        "Worker" w
+        v1_task_runtime runtime
     JOIN
-        v1_task_runtime runtime ON w."id" = runtime.worker_id
-    WHERE
-        w."tenantId" = @tenantId::uuid
-        AND w."tenantId" = runtime.tenant_id
-        AND w."lastHeartbeatAt" < NOW() - INTERVAL '30 seconds'
-        -- evicted tasks are not eligible for re-assignment
-        AND runtime.evicted_at IS NULL
-    LIMIT
-        COALESCE(sqlc.narg('limit')::integer, 1000)
+        locked_tasks task ON
+            task.id = runtime.task_id AND
+            task.inserted_at = runtime.task_inserted_at AND
+            task.retry_count = runtime.retry_count
+    ORDER BY
+        runtime.task_id, runtime.task_inserted_at, runtime.retry_count
     FOR UPDATE OF runtime SKIP LOCKED
 )
 SELECT
-    v1_task.id,
-    v1_task.inserted_at,
-    v1_task.retry_count
+    task.id,
+    task.inserted_at,
+    task.retry_count
 FROM
-    v1_task
+    locked_tasks task
 JOIN
-    tasks_on_inactive_workers lrs ON lrs.task_id = v1_task.id AND lrs.task_inserted_at = v1_task.inserted_at;
+    locked_runtimes runtime ON
+        runtime.task_id = task.id AND
+        runtime.task_inserted_at = task.inserted_at AND
+        runtime.retry_count = task.retry_count
+ORDER BY
+    task.id, task.inserted_at, task.retry_count;
 
 -- name: ProcessRetryQueueItems :many
 WITH rqis_to_delete AS (
