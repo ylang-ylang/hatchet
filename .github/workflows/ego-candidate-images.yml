@@ -2,7 +2,7 @@ name: Build frozen ego Hatchet candidate
 
 on:
   push:
-    branches: [patch/olap-run-identity]
+    branches: [patch/olap-run-identity, patch/concurrency-hot-path]
     paths: [.github/workflows/ego-candidate-images.yml]
 
 permissions:
