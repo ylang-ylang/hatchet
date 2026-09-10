@@ -210,10 +210,18 @@ func (c *ConcurrencyStrategy) Run(ctx context.Context) (*repository.RunConcurren
 	// caller's context expires first, surface a clear error rather than running against an
 	// incomplete index - the build keeps going on its own lifecycle context and a later Run will
 	// proceed once it's ready.
+	buildWaitStarted := time.Now()
 	select {
 	case <-c.built:
 	case <-ctx.Done():
 		return nil, false, fmt.Errorf("timed out waiting for concurrency index to finish building for topic %s: %w", c.topic, ctx.Err())
+	}
+	buildWaitDuration := time.Since(buildWaitStarted)
+	if buildWaitDuration > 100*time.Millisecond {
+		c.l.Warn().Ctx(ctx).
+			Dur("duration", buildWaitDuration).
+			Int64("strategy_id", c.strategyId).
+			Msg("concurrency strategy waited for initial index build")
 	}
 
 	// A failed transaction's Flush may have staged a result before the failure was reported. Every
@@ -224,9 +232,17 @@ func (c *ConcurrencyStrategy) Run(ctx context.Context) (*repository.RunConcurren
 	// current DB state into the sub-queues but never runs the decide step over it, so queued backlog
 	// loaded at build time would otherwise sit unqueued until a new WAL message happened to touch its
 	// sub-queue. This must happen before we process any WAL messages.
+	initialQueueStarted := time.Now()
 	initialResult, err := c.runInitialQueueing(ctx)
 	if err != nil {
 		return nil, false, err
+	}
+	initialQueueDuration := time.Since(initialQueueStarted)
+	if initialQueueDuration > 100*time.Millisecond {
+		c.l.Warn().Ctx(ctx).
+			Dur("duration", initialQueueDuration).
+			Int64("strategy_id", c.strategyId).
+			Msg("concurrency strategy initial queueing was slow")
 	}
 
 	committedResults := make([]*repository.RunConcurrencyResult, 0, maxOutboxBatchesPerRun)
@@ -234,7 +250,18 @@ func (c *ConcurrencyStrategy) Run(ctx context.Context) (*repository.RunConcurren
 
 	for batch := 0; batch < maxOutboxBatchesPerRun && processedMessages < maxOutboxMessagesPerRun; batch++ {
 		batchSize := min(outboxMessagesPerBatch, maxOutboxMessagesPerRun-processedMessages)
+		batchStarted := time.Now()
 		msgs, err := c.outbox.ProcessMessages(ctx, c.topic, pgoutbox.WithBatchSize(batchSize))
+		batchDuration := time.Since(batchStarted)
+		if batchDuration > 100*time.Millisecond {
+			c.l.Warn().Ctx(ctx).
+				Dur("duration", batchDuration).
+				Int("batch", batch).
+				Int("messages", len(msgs)).
+				Int64("strategy_id", c.strategyId).
+				Err(err).
+				Msg("concurrency strategy outbox batch was slow")
+		}
 
 		if err != nil {
 			// The outbox transaction rolled back (flush, message-delete, or commit failure), so undo
@@ -381,6 +408,7 @@ func (c *ConcurrencyStrategy) pruneEmpty(candidates []*subQueue) {
 // transaction back and the messages are redelivered on a later Run.
 func (c *ConcurrencyStrategy) Flush(ctx pgoutbox.FlushContext, msgs []*outboxsqlc.Message) error {
 	tx := ctx.Tx()
+	decodeStarted := time.Now()
 
 	wal := make([]walMessage, 0, len(msgs))
 
@@ -394,7 +422,19 @@ func (c *ConcurrencyStrategy) Flush(ctx pgoutbox.FlushContext, msgs []*outboxsql
 		wal = append(wal, m)
 	}
 
+	decodeDuration := time.Since(decodeStarted)
+	processStarted := time.Now()
 	res, err := c.processWALMessages(ctx, tx, wal)
+	processDuration := time.Since(processStarted)
+
+	if decodeDuration > 100*time.Millisecond || processDuration > 100*time.Millisecond {
+		c.l.Warn().Ctx(ctx).
+			Dur("decode_duration", decodeDuration).
+			Dur("process_duration", processDuration).
+			Int("messages", len(msgs)).
+			Int64("strategy_id", c.strategyId).
+			Msg("concurrency strategy flush was slow")
+	}
 
 	if err != nil {
 		return err
@@ -746,12 +786,14 @@ func applyWAL(sq *subQueue, msgs []walMessage) []slot {
 // processStrategy is the shared WAL-apply -> evict-timeouts -> decide -> flush pipeline used by every
 // strategy. Only the decide step differs per strategy; it is selected once per Run by decide().
 func (c *ConcurrencyStrategy) processStrategy(ctx context.Context, tx pgx.Tx, msgs []walMessage, decide decideFn) (*repository.RunConcurrencyResult, error) {
+	decisionStarted := time.Now()
 	grouped := groupMessagesBySubQueue(msgs)
 
 	// single "now" so every sub-queue evaluates scheduling timeouts against the same instant
 	now := time.Now().UTC()
 
 	touched, slotsToSetFilled, slotsToDelete, slotsToTimeout := c.decideSubQueues(ctx, grouped, now, decide)
+	decisionDuration := time.Since(decisionStarted)
 
 	// Hand the open undo scopes to Run, which finalizes them once ProcessMessages returns. We must
 	// not commit/rollback here: pgoutbox still deletes the messages and commits the transaction
@@ -763,7 +805,19 @@ func (c *ConcurrencyStrategy) processStrategy(ctx context.Context, tx pgx.Tx, ms
 	// Flush within the outbox transaction handed to us by FlushWithTx. We don't retry here: on
 	// failure we return the error so pgoutbox rolls back (the messages are not deleted) and they
 	// are redelivered on a later Run.
+	databaseStarted := time.Now()
 	runResult, err := c.flushToDatabase(ctx, tx, slotsToSetFilled, slotsToDelete, slotsToTimeout)
+	databaseDuration := time.Since(databaseStarted)
+	if decisionDuration > 100*time.Millisecond || databaseDuration > 100*time.Millisecond {
+		c.l.Warn().Ctx(ctx).
+			Dur("decision_duration", decisionDuration).
+			Dur("database_duration", databaseDuration).
+			Int("messages", len(msgs)).
+			Int("filled", len(slotsToSetFilled)).
+			Int("cancelled", len(slotsToDelete)+len(slotsToTimeout)).
+			Int64("strategy_id", c.strategyId).
+			Msg("concurrency strategy processing phase was slow")
+	}
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to flush concurrency slots to database: %w", err)
