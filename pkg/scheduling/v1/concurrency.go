@@ -252,13 +252,28 @@ func (c *ConcurrencyManager) loopConcurrency(ctx context.Context) {
 		start := time.Now()
 
 		var results *v1.RunConcurrencyResult
+		var shouldContinue bool
 		var err error
 		if c.concurrencyStrategy != nil {
-			results, err = c.concurrencyStrategy.Run(ctx)
+			results, shouldContinue, err = c.concurrencyStrategy.Run(ctx)
 		} else {
 			results, err = c.repo.RunConcurrencyStrategy(ctx, c.tenantId, c.strategy)
 		}
 		c.releaseStrategyLocks()
+
+		// Deliver every committed slice after releasing the strategy locks. A later outbox transaction
+		// can fail without invalidating notifications committed by earlier transactions in this Run.
+		if results != nil {
+			c.resultsCh <- &ConcurrencyResults{
+				RunConcurrencyResult: results,
+				TenantId:             c.tenantId,
+			}
+		}
+
+		if shouldContinue {
+			c.notify(ctx)
+		}
+
 		if err != nil {
 			span.End()
 			c.l.Error().Ctx(ctx).Err(err).Msg("error running concurrency strategy")
@@ -268,10 +283,6 @@ func (c *ConcurrencyManager) loopConcurrency(ctx context.Context) {
 		if time.Since(start) > 100*time.Millisecond {
 			c.l.Warn().Ctx(ctx).
 				Msgf("concurrency strategy %d took longer than 100ms (%s) to process %d items", c.strategy.ID, time.Since(start), len(results.Queued))
-		}
-		c.resultsCh <- &ConcurrencyResults{
-			RunConcurrencyResult: results,
-			TenantId:             c.tenantId,
 		}
 
 		span.End()

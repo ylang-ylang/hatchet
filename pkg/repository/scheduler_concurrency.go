@@ -1445,6 +1445,10 @@ func (c *ConcurrencyRepositoryImpl) runCancelNewest(
 }
 
 func (c *ConcurrencyRepositoryImpl) upsertQueuesForQueuedTasks(ctx context.Context, tx sqlcv1.DBTX, tenantId uuid.UUID, queuedTasks []TaskWithQueue) error {
+	if len(queuedTasks) == 0 {
+		return nil
+	}
+
 	uniqueQueues := make(map[string]bool, len(queuedTasks))
 	queueList := make([]string, 0, len(queuedTasks))
 	for _, queue := range queuedTasks {
@@ -1542,22 +1546,27 @@ func (c *ConcurrencyRepositoryImpl) UpdateConcurrencySlotsTx(
 	filledSlots []TaskIdInsertedAtRetryCount,
 	cancelledSlots []CancelledSlotInput,
 ) (*RunConcurrencyResult, error) {
-	updateArgs := make([]sqlcv1.UpdateConcurrencySlotIsFilledParams, len(filledSlots))
+	var filledRows []*sqlcv1.UpdateConcurrencySlotIsFilledBatchRow
 
-	for i, slot := range filledSlots {
-		updateArgs[i] = sqlcv1.UpdateConcurrencySlotIsFilledParams{
-			IsFilled:       true,
-			TaskID:         slot.Id,
-			TaskInsertedAt: slot.InsertedAt,
-			TaskRetryCount: slot.RetryCount,
-			StrategyID:     strategyId,
+	if len(filledSlots) > 0 {
+		updateArgs := make([]sqlcv1.UpdateConcurrencySlotIsFilledParams, len(filledSlots))
+
+		for i, slot := range filledSlots {
+			updateArgs[i] = sqlcv1.UpdateConcurrencySlotIsFilledParams{
+				IsFilled:       true,
+				TaskID:         slot.Id,
+				TaskInsertedAt: slot.InsertedAt,
+				TaskRetryCount: slot.RetryCount,
+				StrategyID:     strategyId,
+			}
 		}
-	}
 
-	filledRows, err := c.queries.UpdateConcurrencySlotIsFilledBatch(ctx, tx, updateArgs)
+		var err error
+		filledRows, err = c.queries.UpdateConcurrencySlotIsFilledBatch(ctx, tx, updateArgs)
 
-	if err != nil {
-		return nil, fmt.Errorf("failed to update concurrency slots: %w", err)
+		if err != nil {
+			return nil, fmt.Errorf("failed to update concurrency slots: %w", err)
+		}
 	}
 
 	// build the queued / next-strategy results from the slots we just filled, mirroring
@@ -1603,10 +1612,15 @@ func (c *ConcurrencyRepositoryImpl) UpdateConcurrencySlotsTx(
 	// note: we'd prefer to call cancelTasks here, but keeping this consistent with the previous concurrency
 	// implementation. the only important thing is that we delete v1_concurrency_slot, but we need to release
 	// other scheduling resources in a precise order which releaseTasks respects, otherwise we deadlock.
-	releasedTasks, err := c.releaseTasks(ctx, tx, tenantId, tasksToCancel)
+	var releasedTasks []*sqlcv1.ReleaseTasksRow
 
-	if err != nil {
-		return nil, fmt.Errorf("failed to release tasks: %w", err)
+	if len(tasksToCancel) > 0 {
+		var err error
+		releasedTasks, err = c.releaseTasks(ctx, tx, tenantId, tasksToCancel)
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to release tasks: %w", err)
+		}
 	}
 
 	cancelled := make([]TaskWithCancelledReason, 0, len(releasedTasks))
@@ -1633,8 +1647,10 @@ func (c *ConcurrencyRepositoryImpl) UpdateConcurrencySlotsTx(
 		})
 	}
 
-	if err := c.upsertQueuesForQueuedTasks(ctx, tx, tenantId, queued); err != nil {
-		return nil, fmt.Errorf("failed to upsert queues for queued tasks: %w", err)
+	if len(queued) > 0 {
+		if err := c.upsertQueuesForQueuedTasks(ctx, tx, tenantId, queued); err != nil {
+			return nil, fmt.Errorf("failed to upsert queues for queued tasks: %w", err)
+		}
 	}
 
 	return &RunConcurrencyResult{

@@ -10,11 +10,14 @@ import (
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/ext"
 	"github.com/google/uuid"
+	lru "github.com/hashicorp/golang-lru/v2"
 
 	"github.com/hatchet-dev/hatchet/pkg/repository/sqlcv1"
 
 	expr "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 )
+
+const stepRunProgramCacheSize = 10000
 
 type CELParser struct {
 	workflowStrEnv     *cel.Env
@@ -22,6 +25,7 @@ type CELParser struct {
 	idempotencyKeyEnv  *cel.Env
 	eventEnv           *cel.Env
 	incomingWebhookEnv *cel.Env
+	stepRunPrograms     *lru.Cache[string, cel.Program]
 }
 
 var checksumDecl = decls.NewFunction("checksum",
@@ -108,6 +112,7 @@ func NewCELParser() *CELParser {
 		checksum,
 		ext.Strings(),
 	)
+	stepRunPrograms, _ := lru.New[string, cel.Program](stepRunProgramCacheSize) //nolint:errcheck // the fixed positive size cannot fail
 
 	return &CELParser{
 		workflowStrEnv:     workflowStrEnv,
@@ -115,6 +120,7 @@ func NewCELParser() *CELParser {
 		idempotencyKeyEnv:  idempotencyKeyEnv,
 		eventEnv:           eventEnv,
 		incomingWebhookEnv: incomingWebhookEnv,
+		stepRunPrograms:     stepRunPrograms,
 	}
 }
 
@@ -279,13 +285,24 @@ type StepRunOut struct {
 }
 
 func (p *CELParser) ParseStepRun(stepRunExpr string) (cel.Program, error) {
+	if prg, ok := p.stepRunPrograms.Get(stepRunExpr); ok {
+		return prg, nil
+	}
+
 	ast, issues := p.stepRunEnv.Compile(stepRunExpr)
 
 	if issues != nil && issues.Err() != nil {
 		return nil, issues.Err()
 	}
 
-	return p.stepRunEnv.Program(ast)
+	prg, err := p.stepRunEnv.Program(ast)
+	if err != nil {
+		return nil, err
+	}
+
+	p.stepRunPrograms.Add(stepRunExpr, prg)
+
+	return prg, nil
 }
 
 func (p *CELParser) ParseAndEvalStepRun(stepRunExpr string, in Input) (*StepRunOut, error) {

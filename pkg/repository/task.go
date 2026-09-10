@@ -2004,6 +2004,10 @@ func (r *TaskRepositoryImpl) ListStuckEvictedDurableOrchestrators(ctx context.Co
 }
 
 func (r *sharedRepository) releaseTasks(ctx context.Context, tx sqlcv1.DBTX, tenantId uuid.UUID, tasks []TaskIdInsertedAtRetryCount) ([]*sqlcv1.ReleaseTasksRow, error) {
+	if len(tasks) == 0 {
+		return []*sqlcv1.ReleaseTasksRow{}, nil
+	}
+
 	taskIds := make([]int64, len(tasks))
 	taskInsertedAts := make([]pgtype.Timestamptz, len(tasks))
 	retryCounts := make([]int32, len(tasks))
@@ -2069,6 +2073,10 @@ func (r *sharedRepository) upsertQueues(ctx context.Context, tx sqlcv1.DBTX, ten
 
 	for queue := range queuesToInsert {
 		uniqueQueues = append(uniqueQueues, queue)
+	}
+
+	if len(uniqueQueues) == 0 {
+		return func() {}, nil
 	}
 
 	err := r.queries.UpsertQueues(ctx, tx, sqlcv1.UpsertQueuesParams{
@@ -2475,30 +2483,39 @@ func (r *sharedRepository) insertTasks(
 				taskConcurrencyKeys := make([]string, 0)
 				taskConcurrencyMaxRuns := make([]pgtype.Int4, 0)
 				var failTaskError error
+				var taskCELInput cel.Input
 
-				for _, strat := range strats {
+				if len(strats) > 0 {
 					var additionalMeta map[string]interface{}
 
 					if len(additionalMetadatas[i]) > 0 {
 						if err := json.Unmarshal(additionalMetadatas[i], &additionalMeta); err != nil {
 							failTaskError = fmt.Errorf("failed to process additional metadata: not a json object")
-							break
 						}
 					}
 
-					if task.Input == nil {
-						failTaskError = fmt.Errorf("failed to parse step expression (%s): input is nil", strat.Expression)
+					if failTaskError == nil {
+						if task.Input == nil {
+							failTaskError = fmt.Errorf("failed to parse step expression (%s): input is nil", strats[0].Expression)
+						} else {
+							taskCELInput = cel.NewInput(
+								cel.WithInput(task.Input.Input),
+								cel.WithAdditionalMetadata(additionalMeta),
+								cel.WithWorkflowRunID(task.ExternalId),
+								cel.WithParents(task.Input.TriggerData.ParentOutputs()),
+							)
+						}
+					}
+				}
+
+				for _, strat := range strats {
+					if failTaskError != nil {
 						break
 					}
 
 					// Make sure to fail the task with a user-friendly error if we can't parse the CEL for priority
 					// Can set fail task error which will insert with an initial state of failed
-					res, err := r.celParser.ParseAndEvalStepRun(strat.Expression, cel.NewInput(
-						cel.WithInput(task.Input.Input),
-						cel.WithAdditionalMetadata(additionalMeta),
-						cel.WithWorkflowRunID(task.ExternalId),
-						cel.WithParents(task.Input.TriggerData.ParentOutputs()),
-					))
+					res, err := r.celParser.ParseAndEvalStepRun(strat.Expression, taskCELInput)
 
 					if err != nil {
 						failTaskError = fmt.Errorf("failed to parse step expression (%s): %w", strat.Expression, err)
@@ -2522,12 +2539,7 @@ func (r *sharedRepository) insertTasks(
 					maxRuns := pgtype.Int4{}
 
 					if strat.MaxRunsExpression.Valid {
-						evaluated, evalErr := r.evalMaxRunsExpression(strat, cel.NewInput(
-							cel.WithInput(task.Input.Input),
-							cel.WithAdditionalMetadata(additionalMeta),
-							cel.WithWorkflowRunID(task.ExternalId),
-							cel.WithParents(task.Input.TriggerData.ParentOutputs()),
-						))
+						evaluated, evalErr := r.evalMaxRunsExpression(strat, taskCELInput)
 
 						if evalErr != nil {
 							failTaskError = evalErr

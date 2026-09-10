@@ -266,14 +266,14 @@ func TestConcurrency_CancelInProgress_InMemory(t *testing.T) {
 		// table) and drains any pending WAL. Running it before inserting tasks guarantees the build
 		// completes first, so the subsequent INSERT WAL messages are processed fresh rather than
 		// double-counted against an index that already hydrated them.
-		_, err := cs.Run(ctx)
+		_, _, err := cs.Run(ctx)
 		require.NoError(t, err)
 
 		// now insert 5 tasks sharing one concurrency key; the insert trigger emits INSERT WAL.
 		createConcurrencyTasks(t, ctx, conf, s, 5)
 
 		// drain the WAL through the in-memory CANCEL_IN_PROGRESS decide step.
-		res, err := cs.Run(ctx)
+		res, _, err := cs.Run(ctx)
 		require.NoError(t, err)
 		require.Len(t, res.Queued, 2, "CANCEL_IN_PROGRESS in-memory should queue maxRuns tasks")
 		require.Len(t, res.Cancelled, 3, "CANCEL_IN_PROGRESS in-memory should cancel the excess tasks")
@@ -307,14 +307,14 @@ func TestConcurrency_CancelNewest_InMemory(t *testing.T) {
 		// table) and drains any pending WAL. Running it before inserting tasks guarantees the build
 		// completes first, so the subsequent INSERT WAL messages are processed fresh rather than
 		// double-counted against an index that already hydrated them.
-		_, err := cs.Run(ctx)
+		_, _, err := cs.Run(ctx)
 		require.NoError(t, err)
 
 		// now insert 5 tasks sharing one concurrency key; the insert trigger emits INSERT WAL.
 		createConcurrencyTasks(t, ctx, conf, s, 5)
 
 		// drain the WAL through the in-memory CANCEL_NEWEST decide step.
-		res, err := cs.Run(ctx)
+		res, _, err := cs.Run(ctx)
 		require.NoError(t, err)
 		require.Len(t, res.Queued, 2, "CANCEL_NEWEST in-memory should queue maxRuns tasks")
 		require.Len(t, res.Cancelled, 3, "CANCEL_NEWEST in-memory should cancel the excess tasks")

@@ -141,7 +141,7 @@ func TestConcurrency_DynamicMaxRuns_PerGroupLimits(t *testing.T) {
 		outbox := newTestOutbox(t, conf)
 		cs := concurrency.NewConcurrencyStrategy(ctx, s.repo, s.strategy, outbox, &l)
 
-		_, err := cs.Run(ctx)
+		_, _, err := cs.Run(ctx)
 		require.NoError(t, err)
 
 		val := func(v int32) pgtype.Int4 { return pgtype.Int4{Int32: v, Valid: true} }
@@ -151,7 +151,7 @@ func TestConcurrency_DynamicMaxRuns_PerGroupLimits(t *testing.T) {
 			[]pgtype.Int4{val(3), val(3), val(3), val(1), val(1)},
 		)
 
-		res, err := cs.Run(ctx)
+		res, _, err := cs.Run(ctx)
 		require.NoError(t, err)
 		require.Len(t, res.Queued, 4, "premium (limit 3) fills 3 and free (limit 1) fills 1; the static max of 1 must not apply")
 		require.Empty(t, res.Cancelled)
@@ -176,7 +176,7 @@ func TestConcurrency_DynamicMaxRuns_ReplayCannotRegressLimit(t *testing.T) {
 		outbox := newTestOutbox(t, conf)
 		cs := concurrency.NewConcurrencyStrategy(ctx, s.repo, s.strategy, outbox, &l)
 
-		_, err := cs.Run(ctx)
+		_, _, err := cs.Run(ctx)
 		require.NoError(t, err)
 
 		val := func(v int32) pgtype.Int4 { return pgtype.Int4{Int32: v, Valid: true} }
@@ -187,7 +187,7 @@ func TestConcurrency_DynamicMaxRuns_ReplayCannotRegressLimit(t *testing.T) {
 			[]pgtype.Int4{val(5), val(5)},
 		)
 
-		res, err := cs.Run(ctx)
+		res, _, err := cs.Run(ctx)
 		require.NoError(t, err)
 		require.Len(t, res.Queued, 2)
 
@@ -199,7 +199,7 @@ func TestConcurrency_DynamicMaxRuns_ReplayCannotRegressLimit(t *testing.T) {
 			[]pgtype.Int4{val(1)},
 		)
 
-		res, err = cs.Run(ctx)
+		res, _, err = cs.Run(ctx)
 		require.NoError(t, err)
 		require.Empty(t, res.Queued, "the lowered limit must hold the new task while 2 grandfathered tasks run")
 
@@ -232,7 +232,7 @@ func TestConcurrency_DynamicMaxRuns_ReplayCannotRegressLimit(t *testing.T) {
 		// guard must keep the limit at 1, so with 1 grandfathered task still running,
 		// nothing new fills. Without the guard the limit would jump back to 5 and the
 		// replayed slot (plus the held task) would fill immediately.
-		res, err = cs.Run(ctx)
+		res, _, err = cs.Run(ctx)
 		require.NoError(t, err)
 		require.Empty(t, res.Queued, "a replayed older task must not restore its stale higher limit")
 
@@ -288,9 +288,9 @@ func TestConcurrency_DynamicMaxRuns_ChainedSlotCarriesValue(t *testing.T) {
 		cs1 := concurrency.NewConcurrencyStrategy(ctx, conf.V1.Scheduler().Concurrency(), staticStrat, outbox, &l)
 		cs2 := concurrency.NewConcurrencyStrategy(ctx, conf.V1.Scheduler().Concurrency(), dynStrat, outbox, &l)
 
-		_, err = cs1.Run(ctx)
+		_, _, err = cs1.Run(ctx)
 		require.NoError(t, err)
-		_, err = cs2.Run(ctx)
+		_, _, err = cs2.Run(ctx)
 		require.NoError(t, err)
 
 		// 3 tasks: distinct keys on the static strategy (all advance) and one shared
@@ -328,13 +328,13 @@ func TestConcurrency_DynamicMaxRuns_ChainedSlotCarriesValue(t *testing.T) {
 
 		// first strategy fills all 3 (distinct keys); each fill makes the slot-update
 		// trigger create the chained slot for the dynamic strategy
-		res, err := cs1.Run(ctx)
+		res, _, err := cs1.Run(ctx)
 		require.NoError(t, err)
 		require.Empty(t, res.Queued, "head slots have next strategies; filling them advances the chain rather than queueing")
 
 		// the chained slots must carry max_runs 3, so the dynamic strategy fills all 3
 		// despite its static max of 1
-		res, err = cs2.Run(ctx)
+		res, _, err = cs2.Run(ctx)
 		require.NoError(t, err)
 		require.Len(t, res.Queued, 3, "the chained slots must carry the dynamic value peeled from next_max_runs")
 

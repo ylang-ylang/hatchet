@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -1302,14 +1301,48 @@ func (q *Queries) RunChildCancelQueuedExceptOldest(ctx context.Context, db DBTX,
 	return items, nil
 }
 
-const updateConcurrencySlotIsFilledBatch = `-- name: UpdateConcurrencySlotIsFilledBatch :one
-UPDATE v1_concurrency_slot
-SET is_filled = $1
-WHERE task_id = $2
-  AND task_inserted_at = $3
-  AND task_retry_count = $4
-  AND strategy_id = $5
-RETURNING task_id, task_inserted_at, task_retry_count, next_parent_strategy_ids, next_strategy_ids, queue_to_notify
+const updateConcurrencySlotIsFilledBatch = `-- name: UpdateConcurrencySlotIsFilledBatch :many
+WITH input AS (
+    SELECT *
+    FROM unnest(
+        $1::boolean[],
+        $2::bigint[],
+        $3::timestamptz[],
+        $4::integer[],
+        $5::bigint[]
+    ) WITH ORDINALITY AS i(is_filled, task_id, task_inserted_at, task_retry_count, strategy_id, input_order)
+), slots_to_update AS MATERIALIZED (
+    SELECT
+        slot.task_id,
+        slot.task_inserted_at,
+        slot.task_retry_count,
+        slot.strategy_id
+    FROM v1_concurrency_slot slot
+    JOIN input i USING (task_id, task_inserted_at, task_retry_count, strategy_id)
+    WHERE i.is_filled = TRUE
+      AND slot.is_filled = FALSE
+    ORDER BY slot.task_id, slot.task_inserted_at, slot.task_retry_count, slot.strategy_id
+    FOR UPDATE OF slot
+), updated_slots AS (
+    UPDATE v1_concurrency_slot slot
+    SET is_filled = TRUE
+    FROM slots_to_update selected
+    WHERE slot.task_id = selected.task_id
+      AND slot.task_inserted_at = selected.task_inserted_at
+      AND slot.task_retry_count = selected.task_retry_count
+      AND slot.strategy_id = selected.strategy_id
+    RETURNING slot.task_id, slot.task_inserted_at, slot.task_retry_count, slot.next_parent_strategy_ids, slot.next_strategy_ids, slot.queue_to_notify, slot.strategy_id
+)
+SELECT
+    updated.task_id,
+    updated.task_inserted_at,
+    updated.task_retry_count,
+    updated.next_parent_strategy_ids,
+    updated.next_strategy_ids,
+    updated.queue_to_notify
+FROM updated_slots updated
+JOIN input i USING (task_id, task_inserted_at, task_retry_count, strategy_id)
+ORDER BY i.input_order
 `
 
 type UpdateConcurrencySlotIsFilledBatchRow struct {
@@ -1322,54 +1355,57 @@ type UpdateConcurrencySlotIsFilledBatchRow struct {
 }
 
 func (q *Queries) UpdateConcurrencySlotIsFilledBatch(ctx context.Context, db DBTX, args []UpdateConcurrencySlotIsFilledParams) ([]*UpdateConcurrencySlotIsFilledBatchRow, error) {
-	batch := &pgx.Batch{}
-
-	// callbacks queued via res.Query run serially while br.Close() drains the
-	// batch, so appending to this shared slice needs no synchronization.
-	items := make([]*UpdateConcurrencySlotIsFilledBatchRow, 0, len(args))
-	var scanErr error
-
-	for _, arg := range args {
-		res := batch.Queue(updateConcurrencySlotIsFilledBatch,
-			arg.IsFilled,
-			arg.TaskID,
-			arg.TaskInsertedAt,
-			arg.TaskRetryCount,
-			arg.StrategyID,
-		)
-
-		res.Query(func(rows pgx.Rows) error {
-			defer rows.Close()
-
-			for rows.Next() {
-				var i UpdateConcurrencySlotIsFilledBatchRow
-				if err := rows.Scan(
-					&i.TaskID,
-					&i.TaskInsertedAt,
-					&i.TaskRetryCount,
-					&i.NextParentStrategyIds,
-					&i.NextStrategyIds,
-					&i.QueueToNotify,
-				); err != nil {
-					scanErr = err
-					return err
-				}
-
-				items = append(items, &i)
-			}
-
-			return rows.Err()
-		})
+	if len(args) == 0 {
+		return []*UpdateConcurrencySlotIsFilledBatchRow{}, nil
 	}
 
-	br := db.SendBatch(ctx, batch)
+	isFilled := make([]bool, len(args))
+	taskIDs := make([]int64, len(args))
+	taskInsertedAts := make([]pgtype.Timestamptz, len(args))
+	taskRetryCounts := make([]int32, len(args))
+	strategyIDs := make([]int64, len(args))
 
-	if err := br.Close(); err != nil {
+	for i, arg := range args {
+		isFilled[i] = arg.IsFilled
+		taskIDs[i] = arg.TaskID
+		taskInsertedAts[i] = arg.TaskInsertedAt
+		taskRetryCounts[i] = arg.TaskRetryCount
+		strategyIDs[i] = arg.StrategyID
+	}
+
+	rows, err := db.Query(
+		ctx,
+		updateConcurrencySlotIsFilledBatch,
+		isFilled,
+		taskIDs,
+		taskInsertedAts,
+		taskRetryCounts,
+		strategyIDs,
+	)
+	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
-	if scanErr != nil {
-		return nil, scanErr
+	items := make([]*UpdateConcurrencySlotIsFilledBatchRow, 0, len(args))
+	for rows.Next() {
+		var i UpdateConcurrencySlotIsFilledBatchRow
+		if err := rows.Scan(
+			&i.TaskID,
+			&i.TaskInsertedAt,
+			&i.TaskRetryCount,
+			&i.NextParentStrategyIds,
+			&i.NextStrategyIds,
+			&i.QueueToNotify,
+		); err != nil {
+			return nil, err
+		}
+
+		items = append(items, &i)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return items, nil

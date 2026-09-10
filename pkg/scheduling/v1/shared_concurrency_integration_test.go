@@ -220,13 +220,13 @@ func TestConcurrency_SharedStrategy_CrossWorkflow(t *testing.T) {
 		outbox := newTestOutbox(t, conf)
 		cs := concurrency.NewConcurrencyStrategy(ctx, s.repo, s.strategyDescriptor(), outbox, &l)
 
-		_, err = cs.Run(ctx)
+		_, _, err = cs.Run(ctx)
 		require.NoError(t, err)
 
 		createSharedConcurrencyTasks(t, ctx, conf, s, s.workflows[0], 2)
 		createSharedConcurrencyTasks(t, ctx, conf, s, s.workflows[1], 2)
 
-		res, err := cs.Run(ctx)
+		res, _, err := cs.Run(ctx)
 		require.NoError(t, err)
 		require.Len(t, res.Queued, 1, "4 tasks across 2 workflows against shared max=1 should queue exactly 1")
 		require.Empty(t, res.Cancelled, "GROUP_ROUND_ROBIN should not cancel excess tasks")

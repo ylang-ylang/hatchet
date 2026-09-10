@@ -22,8 +22,11 @@ import (
 )
 
 const (
-	minBackoffDuration = 100 * time.Millisecond
-	maxBackoffDuration = 10 * time.Second
+	minBackoffDuration       = 100 * time.Millisecond
+	maxBackoffDuration       = 10 * time.Second
+	outboxMessagesPerBatch   = 250
+	maxOutboxBatchesPerRun   = 4
+	maxOutboxMessagesPerRun  = outboxMessagesPerBatch * maxOutboxBatchesPerRun
 )
 
 type ConcurrencyStrategy struct {
@@ -191,10 +194,10 @@ func (c *ConcurrencyStrategy) buildIndexLoop(ctx context.Context) {
 	}
 }
 
-// Run drains the strategy's outbox topic, replaying every WAL message into the in-memory
-// index and flushing the resulting slot decisions to the database. It returns the merged
-// *repository.RunConcurrencyResult across all batches processed this tick.
-func (c *ConcurrencyStrategy) Run(ctx context.Context) (*repository.RunConcurrencyResult, error) {
+// Run processes a bounded slice of the strategy's outbox topic, replaying each WAL message into
+// the in-memory index and flushing the resulting slot decisions to the database. The boolean result
+// is true when the slice limit was reached and the manager must schedule another Run.
+func (c *ConcurrencyStrategy) Run(ctx context.Context) (*repository.RunConcurrencyResult, bool, error) {
 	ctx, span := telemetry.NewSpan(ctx, "concurrency-strategy-run")
 	defer span.End()
 
@@ -210,10 +213,11 @@ func (c *ConcurrencyStrategy) Run(ctx context.Context) (*repository.RunConcurren
 	select {
 	case <-c.built:
 	case <-ctx.Done():
-		return nil, fmt.Errorf("timed out waiting for concurrency index to finish building for topic %s: %w", c.topic, ctx.Err())
+		return nil, false, fmt.Errorf("timed out waiting for concurrency index to finish building for topic %s: %w", c.topic, ctx.Err())
 	}
 
-	// discard any results left over from a previous aborted Run before we start draining
+	// A failed transaction's Flush may have staged a result before the failure was reported. Every
+	// normal exit drains pending immediately, but clear any abandoned value defensively.
 	c.takePending()
 
 	// Before draining the WAL, run the one-time post-build queueing pass. buildIndex hydrates the
@@ -221,35 +225,46 @@ func (c *ConcurrencyStrategy) Run(ctx context.Context) (*repository.RunConcurren
 	// loaded at build time would otherwise sit unqueued until a new WAL message happened to touch its
 	// sub-queue. This must happen before we process any WAL messages.
 	initialResult, err := c.runInitialQueueing(ctx)
-
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	for {
-		msgs, err := c.outbox.ProcessMessages(ctx, c.topic)
+	committedResults := make([]*repository.RunConcurrencyResult, 0, maxOutboxBatchesPerRun)
+	processedMessages := 0
+
+	for batch := 0; batch < maxOutboxBatchesPerRun && processedMessages < maxOutboxMessagesPerRun; batch++ {
+		batchSize := min(outboxMessagesPerBatch, maxOutboxMessagesPerRun-processedMessages)
+		msgs, err := c.outbox.ProcessMessages(ctx, c.topic, pgoutbox.WithBatchSize(batchSize))
 
 		if err != nil {
-			// the outbox transaction rolled back (flush, message-delete, or commit failure), so undo
-			// this batch's in-memory mutations to keep the index consistent with the database. the
-			// messages are not deleted and will be redelivered on a later Run.
+			// The outbox transaction rolled back (flush, message-delete, or commit failure), so undo
+			// this batch's in-memory mutations and discard only its uncommitted result. Results moved
+			// into committedResults came from earlier committed transactions and must still be delivered.
 			c.rollbackScopes()
-			return nil, fmt.Errorf("failed to process outbox messages for topic %s: %w", c.topic, err)
+			c.takePending()
+
+			partial := mergeResults(append(committedResults, initialResult))
+			if !hasNotifications(partial) {
+				partial = nil
+			}
+
+			return partial, false, fmt.Errorf("failed to process outbox messages for topic %s: %w", c.topic, err)
 		}
 
 		// ProcessMessages only returns without error once the transaction has committed, so the
-		// in-memory mutations are now durable - discard the undo log and prune any sub-queue this
-		// batch emptied (its slots were all deleted/cancelled), keeping the index from accumulating
-		// idle keys.
+		// in-memory mutations are now durable. Move this batch's result out of pending before another
+		// transaction starts, then discard the undo log and prune sub-queues emptied by the batch.
+		committedResults = append(committedResults, c.takePending()...)
 		c.pruneEmpty(c.commitScopes())
 
-		// no more messages queued for this topic; we've drained it
 		if len(msgs) == 0 {
-			break
+			return mergeResults(append(committedResults, initialResult)), false, nil
 		}
+
+		processedMessages += len(msgs)
 	}
 
-	return mergeResults(append(c.takePending(), initialResult)), nil
+	return mergeResults(append(committedResults, initialResult)), true, nil
 }
 
 // runInitialQueueing runs the post-build queueing pass exactly once. It is idempotent across Runs:
@@ -388,6 +403,10 @@ func (c *ConcurrencyStrategy) Flush(ctx pgoutbox.FlushContext, msgs []*outboxsql
 	c.appendPending(res)
 
 	return nil
+}
+
+func hasNotifications(res *repository.RunConcurrencyResult) bool {
+	return res != nil && (len(res.Queued) > 0 || len(res.Cancelled) > 0 || len(res.NextConcurrencyStrategies) > 0)
 }
 
 func mergeResults(results []*repository.RunConcurrencyResult) *repository.RunConcurrencyResult {

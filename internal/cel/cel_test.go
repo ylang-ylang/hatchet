@@ -437,3 +437,25 @@ func TestCELParserEventExpression(t *testing.T) {
 		})
 	}
 }
+
+func TestStepRunProgramCacheUsesCurrentInputAndExpression(t *testing.T) {
+	parser := cel.NewCELParser()
+
+	first, err := parser.ParseAndEvalStepRun(`input.value`, cel.NewInput(
+		cel.WithInput(map[string]interface{}{"value": "first"}),
+	))
+	assert.NoError(t, err)
+	assert.Equal(t, "first", *first.String)
+
+	second, err := parser.ParseAndEvalStepRun(`input.value`, cel.NewInput(
+		cel.WithInput(map[string]interface{}{"value": "second"}),
+	))
+	assert.NoError(t, err)
+	assert.Equal(t, "second", *second.String, "a cached program must evaluate the current task input")
+
+	changedExpression, err := parser.ParseAndEvalStepRun(`input.other`, cel.NewInput(
+		cel.WithInput(map[string]interface{}{"value": "stale", "other": "new expression"}),
+	))
+	assert.NoError(t, err)
+	assert.Equal(t, "new expression", *changedExpression.String, "expression text must select the compiled program")
+}
